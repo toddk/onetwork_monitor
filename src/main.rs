@@ -43,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MPSC channel for sending parsed events from capture to processor
     let (packet_event_sender, packet_event_receiver) = mpsc::channel::<NetworkEvent>(args.channel_capacity);
 
-    // MPSC channel for sending buffered events from processor to Ollama client
-    let (ollama_prompt_sender, mut ollama_prompt_receiver) = mpsc::channel::<Vec<NetworkEvent>>(args.channel_capacity);
+    // MPSC channel for sending requests to the event processor and receiving responses
+    let (processor_request_sender, processor_request_receiver) = mpsc::channel::<(String, mpsc::Sender<Vec<NetworkEvent>>)>(1);
 
     // Packet Capture Task
     // This will run in a separate async task and send events to packet_event_sender
@@ -56,43 +56,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Network Event Processor Task
     let mut event_processor = NetworkEventProcessor::new(args.buffer_size, args.channel_capacity);
-    let processor_ollama_sender = ollama_prompt_sender.clone(); // Clone for sending
     tokio::spawn(async move {
-        event_processor.run(packet_event_receiver, processor_ollama_sender).await;
+        event_processor.run(packet_event_receiver, processor_request_receiver).await;
     });
 
-    // Ollama Client Task
+    // Ollama Client
     let ollama_client = ollama_client::OllamaClient::new(args.ollama_url.clone(), args.model.clone());
     if let Err(e) = ollama_client.check_connection().await {
         error!("Ollama connection check failed: {}", e);
         return Ok(()); // Exit if we can't connect
     }
 
-    tokio::spawn(async move {
-        while let Some(events_batch) = ollama_prompt_receiver.recv().await {
-            info!("Received {} events for Ollama processing.", events_batch.len());
+    info!("Network monitoring started. Ask me a question about the network traffic.");
+    info!("Type 'exit' or 'quit' to stop.");
 
-            let mut prompt = String::from("Analyze the following network events for anomalies, unusual patterns, or interesting insights. Focus on potential security concerns, performance issues, or unusual communication flows. Provide a concise summary and highlight any anomalies.\n\n");
-            for event in events_batch {
-                prompt.push_str(&format!("Timestamp: {}, Source: {}, Dest: {}, Protocol: {}, Summary: {}\n",
-                                         event.timestamp, event.source_ip, event.dest_ip, event.protocol, event.summary));
+    use std::io::{self, Write};
+
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        print!(">> ");
+        io::stdout().flush()?;
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await?;
+        let input = line.trim();
+
+        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("/q") {
+            break;
+        }
+
+        if input.is_empty() {
+            continue;
+        }
+
+        info!("You asked: {}", input);
+        info!("Processing your question...");
+
+        // Channel for receiving events from the processor for this specific query
+        let (query_events_sender, mut query_events_receiver) = mpsc::channel::<Vec<NetworkEvent>>(1);
+
+        // Send a request to the event processor to get current events
+        if let Err(e) = processor_request_sender.send((input.to_string(), query_events_sender)).await {
+            error!("Failed to send request to event processor: {}", e);
+            continue;
+        }
+
+        // Wait for the event processor to send back the events
+        let events_batch = match query_events_receiver.recv().await {
+            Some(events) => events,
+            None => {
+                error!("Event processor disconnected or sent no events.");
+                continue;
             }
+        };
 
-            match ollama_client.generate(&prompt).await {
-                Ok(response) => {
-                    info!("Ollama Analysis:\n{}", response);
-                    // Here you would implement logic to store, alert, or display the analysis
-                },
-                Err(e) => {
-                    error!("Error generating Ollama response: {}", e);
-                }
+        if events_batch.is_empty() {
+            info!("No network events captured yet to analyze.");
+            continue;
+        }
+
+        info!("Preparing prompt for Ollama with {} events.", events_batch.len());
+
+        let mut prompt = format!("User Question: {}\n\nAnalyze the following network events to answer the user's question. Provide a concise and direct answer based on the data. If the data doesn't directly support the answer, state that. \n\nNetwork Events:\n", input);
+        for event in events_batch {
+            prompt.push_str(&format!("Timestamp: {}, Source: {}, Dest: {}, Protocol: {}, Summary: {}\n",
+                                     event.timestamp, event.source_ip, event.dest_ip, event.protocol, event.summary));
+        }
+
+        match ollama_client.generate(&prompt).await {
+            Ok(response) => {
+                println!("\nOllama Response:\n{}", response);
+            },
+            Err(e) => {
+                error!("Error generating Ollama response: {}", e);
             }
         }
-    });
+    }
 
-    // Keep the main thread alive, allowing Tokio tasks to run
-    // This is a simple way; for a more robust application, you'd handle shutdown signals.
-    tokio::signal::ctrl_c().await?;
+    info!("Shutting down...");
     info!("Ctrl+C received, shutting down...");
 
     Ok(())

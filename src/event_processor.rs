@@ -2,7 +2,7 @@
 use chrono::{DateTime, Utc};
 use log::{info, error};
 use std::collections::VecDeque;
-use tokio::time::Duration;
+
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct NetworkEvent {
@@ -17,50 +17,33 @@ pub struct NetworkEvent {
 pub struct NetworkEventProcessor {
     buffer: VecDeque<NetworkEvent>,
     max_buffer_size: usize,
-    pub sender: tokio::sync::mpsc::Sender<NetworkEvent>,
-    receiver: tokio::sync::mpsc::Receiver<NetworkEvent>,
 }
 
 impl NetworkEventProcessor {
-    pub fn new(max_buffer_size: usize, channel_capacity: usize) -> Self {
-        let (sender, receiver) = tokio::sync::mpsc::channel(channel_capacity);
+    pub fn new(max_buffer_size: usize, _channel_capacity: usize) -> Self {
         NetworkEventProcessor {
             buffer: VecDeque::with_capacity(max_buffer_size),
             max_buffer_size,
-            sender,
-            receiver,
         }
     }
 
-    // This would run in its own async task
-    pub async fn run(&mut self, mut receiver: tokio::sync::mpsc::Receiver<NetworkEvent>, ollama_client_sender: tokio::sync::mpsc::Sender<Vec<NetworkEvent>>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(30)); // Process every 30 seconds
-        interval.tick().await; // Initial tick to avoid immediate processing
-
+    pub async fn run(&mut self, mut packet_event_receiver: tokio::sync::mpsc::Receiver<NetworkEvent>, mut processor_request_receiver: tokio::sync::mpsc::Receiver<(String, tokio::sync::mpsc::Sender<Vec<NetworkEvent>>)>) {
         loop {
             tokio::select! {
-                Some(event) = receiver.recv() => {
+                Some(event) = packet_event_receiver.recv() => {
                     self.buffer.push_back(event);
-                    if self.buffer.len() >= self.max_buffer_size {
-                        info!("Buffer full, triggering Ollama processing.");
-                        self.process_buffer_and_send_to_ollama(ollama_client_sender.clone()).await;
+                    // Optionally, trim buffer if it exceeds max_buffer_size
+                    if self.buffer.len() > self.max_buffer_size {
+                        self.buffer.pop_front();
                     }
                 },
-                _ = interval.tick() => {
-                    if !self.buffer.is_empty() {
-                        info!("Time interval passed, triggering Ollama processing.");
-                        self.process_buffer_and_send_to_ollama(ollama_client_sender.clone()).await;
+                Some((_query, response_sender)) = processor_request_receiver.recv() => {
+                    info!("Received request for network events. Sending {} events.", self.buffer.len());
+                    let events: Vec<NetworkEvent> = self.buffer.drain(..).collect();
+                    if let Err(e) = response_sender.send(events).await {
+                        error!("Failed to send events back to main: {}", e);
                     }
                 },
-            }
-        }
-    }
-
-    async fn process_buffer_and_send_to_ollama(&mut self, sender: tokio::sync::mpsc::Sender<Vec<NetworkEvent>>) {
-        let events: Vec<NetworkEvent> = self.buffer.drain(..).collect();
-        if !events.is_empty() {
-            if let Err(e) = sender.send(events).await {
-                error!("Failed to send events to Ollama client: {}", e);
             }
         }
     }
